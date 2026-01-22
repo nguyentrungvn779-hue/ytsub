@@ -1,173 +1,177 @@
-from flask import Flask, render_template, request, send_file
-import yt_dlp
-import csv
-import uuid
+# app.py
 import os
-import shutil
 import re
+import io
+import csv
+import time
+from typing import List, Dict, Optional, Tuple
 
-import webvtt  # pip install webvtt-py
+from flask import Flask, render_template, request, jsonify, send_file
+
+from pytube import Channel, YouTube
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    VideoUnavailable,
+    TooManyRequests,
+)
 
 app = Flask(__name__)
 
-# -----------------------------
-# LẤY 100 VIDEO GẦN NHẤT TỪ KÊNH
-# -----------------------------
-def get_latest_video_ids(channel_url: str, limit: int = 100) -> list[str]:
-    url = channel_url.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
+# -----------------------
+# CONFIG
+# -----------------------
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "100"))
+DEFAULT_LANGS = ["vi", "en"]  # ưu tiên vi trước, không có thì lấy en
+REQUEST_SLEEP = float(os.environ.get("REQUEST_SLEEP", "0.2"))  # giảm bị rate limit
 
-    # Ưu tiên /videos để giảm dính Shorts
-    if "youtube.com/" in url and "/videos" not in url and "/watch" not in url:
-        url = url.rstrip("/") + "/videos"
 
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-        "playlistend": limit,
-        "nocheckcertificate": True,
-    }
+# -----------------------
+# HELPERS
+# -----------------------
+def extract_video_id(url: str) -> Optional[str]:
+    """
+    Hỗ trợ các dạng:
+    - https://www.youtube.com/watch?v=VIDEOID
+    - https://youtu.be/VIDEOID
+    - https://www.youtube.com/shorts/VIDEOID
+    """
+    if not url:
+        return None
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    url = url.strip()
 
-    entries = info.get("entries") or []
-    video_ids = []
+    # youtu.be/<id>
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return m.group(1)
 
-    for e in entries:
-        vid = e.get("id")
-        duration = e.get("duration")
+    # watch?v=<id>
+    m = re.search(r"v=([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return m.group(1)
 
-        # BỎ SHORTS nếu có duration < 60 giây
-        if duration is not None and duration < 60:
-            continue
+    # shorts/<id>
+    m = re.search(r"/shorts/([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return m.group(1)
 
-        if vid:
-            video_ids.append(vid)
+    return None
 
-        if len(video_ids) >= limit:
+
+def normalize_channel_url(channel_url: str) -> str:
+    """
+    Chấp nhận:
+    - URL kênh dạng /@handle
+    - /channel/<id>
+    - /c/<name>
+    - /user/<name>
+    """
+    if not channel_url:
+        return ""
+    return channel_url.strip()
+
+
+def get_channel_video_urls(channel_url: str, limit: int = 100) -> List[str]:
+    """
+    Dùng pytube Channel để lấy danh sách video URL của kênh.
+    Lưu ý: YouTube có thể thay đổi, một số kênh sẽ không lấy được.
+    """
+    ch = Channel(channel_url)
+    urls = []
+    for u in ch.video_urls:
+        urls.append(u)
+        if len(urls) >= limit:
             break
-
-    return video_ids
-
-
-# -----------------------------
-# ĐỌC SUBTITLE TỪ FILE .VTT -> TEXT
-# -----------------------------
-def vtt_to_text(vtt_path: str) -> str:
-    texts = []
-    for caption in webvtt.read(vtt_path):
-        t = caption.text.strip()
-        if t:
-            texts.append(t)
-
-    # làm sạch bớt ký tự lặp
-    raw = " ".join(texts)
-    raw = re.sub(r"\s+", " ", raw).strip()
-    return raw
+    return urls
 
 
-# -----------------------------
-# LẤY SUB CHO 1 VIDEO BẰNG yt-dlp
-# Ưu tiên: VI manual -> EN manual -> VI auto -> EN auto
-# -----------------------------
-def fetch_subtitle_text(video_id: str, workdir: str):
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # yt-dlp sẽ tải sub về workdir
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "writesubtitles": True,        # sub người upload
-        "writeautomaticsub": True,     # sub auto
-        "subtitlesformat": "vtt",
-        "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
-        "nocheckcertificate": True,
-    }
-
+def get_video_title_and_url(video_url: str) -> Tuple[str, str, str]:
+    """
+    Trả về (video_id, title, url)
+    """
+    vid = extract_video_id(video_url) or ""
+    title = ""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # download() để nó thật sự ghi file sub ra ổ
-            ydl.download([video_url])
+        yt = YouTube(video_url)
+        title = yt.title or ""
+        # chuẩn hoá URL
+        video_url = yt.watch_url or video_url
+        vid = yt.video_id or vid
+    except Exception:
+        # nếu pytube fail vẫn trả cái đang có
+        pass
+    return vid, title, video_url
+
+
+def transcript_to_text(transcript: List[Dict]) -> str:
+    """
+    transcript list -> gộp text thành 1 chuỗi
+    """
+    return " ".join([x.get("text", "").strip() for x in transcript if x.get("text")])
+
+
+def fetch_transcript(video_id: str, langs: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Trả về (text, reason_if_fail)
+    """
+    try:
+        # ưu tiên transcript theo langs
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
+        return transcript_to_text(transcript), None
+    except TranscriptsDisabled:
+        return None, "TRANSCRIPTS_DISABLED"
+    except NoTranscriptFound:
+        return None, "NO_TRANSCRIPT_FOUND"
+    except VideoUnavailable:
+        return None, "VIDEO_UNAVAILABLE"
+    except TooManyRequests:
+        return None, "TOO_MANY_REQUESTS"
     except Exception as e:
-        return ("KHÔNG CÓ SUB", f"YTDLP_ERROR_{type(e).__name__}", "")
-
-    # Sau khi tải xong, tìm file vtt theo thứ tự ưu tiên
-    # Một số file sẽ có dạng: <id>.vi.vtt, <id>.en.vtt, <id>.vi-orig.vtt, <id>.en-orig.vtt...
-    candidates = [
-        f"{video_id}.vi.vtt",
-        f"{video_id}.vi-orig.vtt",
-        f"{video_id}.en.vtt",
-        f"{video_id}.en-orig.vtt",
-    ]
-
-    # auto-captions đôi khi ra dạng: <id>.vi.vtt nhưng nội dung là auto,
-    # nên mình ghi reason theo file tìm được là đủ để anh kiểm tra.
-    for name in candidates:
-        path = os.path.join(workdir, name)
-        if os.path.exists(path):
-            text = vtt_to_text(path)
-            if text:
-                return ("CÓ SUB", f"FOUND_{name}", text)
-            else:
-                return ("KHÔNG CÓ SUB", f"EMPTY_{name}", "")
-
-    # Nếu không thấy trong candidates, quét hết file vtt trong folder
-    all_vtt = [f for f in os.listdir(workdir) if f.endswith(".vtt") and f.startswith(video_id)]
-    if all_vtt:
-        # lấy cái đầu tiên cho chắc
-        path = os.path.join(workdir, all_vtt[0])
-        text = vtt_to_text(path)
-        if text:
-            return ("CÓ SUB", f"FOUND_{all_vtt[0]}", text)
-        return ("KHÔNG CÓ SUB", f"EMPTY_{all_vtt[0]}", "")
-
-    return ("KHÔNG CÓ SUB", "NO_VTT_FILE", "")
+        return None, f"ERROR_{type(e).__name__}"
 
 
-@app.route("/", methods=["GET", "POST"])
+def safe_str(x) -> str:
+    return (x or "").strip()
+
+
+# -----------------------
+# ROUTES
+# -----------------------
+@app.route("/", methods=["GET"])
 def index():
-    if request.method == "POST":
-        channel_url = request.form.get("channel_url", "").strip()
-
-        # Tạo thư mục tạm để chứa subtitle
-        job_id = str(uuid.uuid4())
-        tmp_dir = f"tmp_{job_id}"
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        csv_name = f"subs_{job_id}.csv"
-
-        try:
-            video_ids = get_latest_video_ids(channel_url, limit=100)
-            if not video_ids:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                return "<h3>Không lấy được video từ kênh này. Anh thử link kênh khác.</h3>"
-        except Exception as e:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return f"<h3>Lỗi khi lấy danh sách video:</h3><pre>{str(e)}</pre>"
-
-        results = []
-        for idx, video_id in enumerate(video_ids, start=1):
-            print(f"Đang xử lý {idx}/{len(video_ids)}: {video_id}")
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-            status, reason, text = fetch_subtitle_text(video_id, tmp_dir)
-            results.append([video_url, status, reason, text])
-
-        with open(csv_name, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Video URL", "Status", "Reason", "Transcript"])
-            writer.writerows(results)
-
-        # dọn thư mục tạm
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        return send_file(csv_name, as_attachment=True)
-
     return render_template("index.html")
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route("/fetch", methods=["POST"])
+def fetch():
+    """
+    Nhận channel_url và trả về JSON list:
+    [
+      {title, url, video_id, status, reason, transcript}
+    ]
+    """
+    channel_url = safe_str(request.form.get("channel_url"))
+    channel_url = normalize_channel_url(channel_url)
+
+    if not channel_url:
+        return jsonify({"error": "Vui lòng dán link kênh YouTube."}), 400
+
+    results: List[Dict] = []
+    try:
+        video_urls = get_channel_video_urls(channel_url, limit=MAX_RESULTS)
+        if not video_urls:
+            return jsonify({"error": "Không lấy được danh sách video. Có thể link kênh sai hoặc YouTube chặn."}), 400
+
+        for idx, vurl in enumerate(video_urls, start=1):
+            time.sleep(REQUEST_SLEEP)
+
+            video_id, title, final_url = get_video_title_and_url(vurl)
+            if not video_id:
+                results.append({
+                    "title": title or f"Video {idx}",
+                    "url": final_url,
+                    "video_id": "",
+                    "status": "KHÔNG CÓ SUB",
+                    "reason": "INVALID_VIDEO_ID",
